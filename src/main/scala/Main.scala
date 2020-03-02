@@ -1,39 +1,33 @@
 import java.awt.image.BufferedImage
 import java.io.File
 
+import akka.NotUsed
 import akka.actor.ActorSystem
-import akka.http.scaladsl.Http
-import akka.http.scaladsl.server.Directives._
 import akka.http.scaladsl.common.{EntityStreamingSupport, JsonEntityStreamingSupport}
 import akka.http.scaladsl.marshallers.sprayjson.SprayJsonSupport
-import akka.http.scaladsl.model.StatusCodes
-import akka.stream.ActorMaterializer
-import akka.stream.scaladsl.{Flow, Sink, Source, StreamConverters}
+import akka.stream.SystemMaterializer
+import akka.stream.scaladsl.{Flow, Sink, Source}
+import com.joestelmach.natty.Parser
 import com.recognition.software.jdeskew.{ImageDeskew, ImageUtil}
 import javax.imageio.ImageIO
 import net.sourceforge.tess4j.Tesseract
 import net.sourceforge.tess4j.util.ImageHelper
-import spray.json.{DefaultJsonProtocol, RootJsonFormat}
-import org.bytedeco.javacv.Java2DFrameUtils
-import org.bytedeco.javacpp.indexer.UByteRawIndexer
-import org.bytedeco.javacpp.opencv_core._
-
-import scala.concurrent.ExecutionContextExecutor
-import opennlp.tools.namefind.TokenNameFinderModel
-import opennlp.tools.namefind.NameFinderME
+import opennlp.tools.namefind.{NameFinderME, TokenNameFinderModel}
+import opennlp.tools.sentdetect.{SentenceDetectorME, SentenceModel}
+import opennlp.tools.tokenize.{TokenizerME, TokenizerModel}
 import opennlp.tools.util.Span
-import opennlp.tools.tokenize.TokenizerModel
-import opennlp.tools.tokenize.TokenizerME
-import opennlp.tools.sentdetect.SentenceDetectorME
-import opennlp.tools.sentdetect.SentenceModel
-import com.joestelmach.natty.Parser
+import org.bytedeco.javacpp.indexer.UByteRawIndexer
+import org.bytedeco.javacv.Java2DFrameUtils
+import org.bytedeco.opencv.opencv_core.Mat
+import spray.json.{DefaultJsonProtocol, RootJsonFormat}
 
-object Main extends App with OCR with Spell with NLP with Natty {
+import scala.concurrent.{ExecutionContextExecutor, Future}
+
+object Main extends OCR with Spell with NLP with Natty {
   implicit val system: ActorSystem = ActorSystem("ocr")
   implicit val executor: ExecutionContextExecutor = system.dispatcher
-  implicit val materializer: ActorMaterializer = ActorMaterializer()
+  implicit val materializer = SystemMaterializer(system)
   implicit val jsonStreamingSupport: JsonEntityStreamingSupport = EntityStreamingSupport.json()
-  import MyJsonProtocol._
 
   def imageDeSkew(skewThreshold:Double = 0.050) = Flow[BufferedImage].map(bi => {
     val deSkew = new ImageDeskew(bi)
@@ -48,10 +42,11 @@ object Main extends App with OCR with Spell with NLP with Natty {
 
   def imageToBinaryImage = Flow[BufferedImage].map(img => {
     val bin = ImageHelper.convertImageToBinary(img)
-    bin
+    ImageUtil.rotate(bin, -90, 0, 0)
   })
 
   def bufferedImageToMat = Flow[BufferedImage].map(bi => {
+    import org.bytedeco.opencv.global.opencv_core.CV_8UC
     val mat = new Mat(bi.getHeight, bi.getWidth, CV_8UC(3))
     val indexer:UByteRawIndexer = mat.createIndexer()
     for (y <- 0 until bi.getHeight()) {
@@ -70,25 +65,25 @@ object Main extends App with OCR with Spell with NLP with Natty {
     Java2DFrameUtils.toBufferedImage(mat)
   })
 
-  import org.bytedeco.javacpp.{opencv_photo => Photo}
   def enhanceMat = Flow[Mat].map(mat => {
     val src = mat.clone()
+    import org.bytedeco.opencv.global.{opencv_photo => Photo}
     Photo.fastNlMeansDenoising(mat, src, 40, 7, 21)
     val dst = src.clone()
     Photo.detailEnhance(src, dst)
     dst
   })
 
-  def extractPersons = Flow[OcrSuggestions].map(ocr => {
+  private def extractPersons = Flow[OcrSuggestions].map(ocr => {
     val tokens = tokenizer.tokenize(ocr.ocr)
     val spans:Array[Span] = personFinderME.find(tokens)
     val persons = spans.toList.map(span => tokens(span.getStart()))
     OcrSuggestionsPersons(ocr.ocr, ocr.suggestions, persons)
   })
 
-  def extractDates = Flow[OcrSuggestionsPersons].map(ocr => {
+  private def extractDates: Flow[OcrSuggestionsPersons, OcrSuggestionsPersonsDates, NotUsed] = Flow[OcrSuggestionsPersons].map(ocr => {
     val sentences = sentenceDetector.sentDetect(ocr.ocr.replaceAll("\n", " ")).toList
-    import scala.collection.JavaConverters._
+    import scala.jdk.CollectionConverters._
     val dates = sentences.map(sentence => parser.parse(sentence))
       .flatMap(dateGroups => dateGroups.asScala.toList)
       .map(dateGroup => (dateGroup.getDates().asScala.toList.map(_.toString()), dateGroup.getText()))
@@ -96,9 +91,9 @@ object Main extends App with OCR with Spell with NLP with Natty {
     OcrSuggestionsPersonsDates(ocr.ocr, ocr.suggestions, ocr.persons, dates)
   })
 
-  def spellCheck = Flow[String].map(ocr => {
+  private def spellCheck = Flow[String].map(ocr => {
     println(ocr)
-    import scala.collection.JavaConverters._
+    import scala.jdk.CollectionConverters._
     val words: Set[String] = ocr.replaceAll("-\n", "").replaceAll("\n", " ").replaceAll("-"," ").split("\\s+")
       .map(_.replaceAll(
       "[^a-zA-Z'’\\d\\s]", "") // Remove most punctuation
@@ -112,44 +107,41 @@ object Main extends App with OCR with Spell with NLP with Natty {
     OcrSuggestions(ocr, suggestions)
   })
 
-  def imageOcr = Flow[BufferedImage].map(tesseract.doOCR)
+  private def imageOcr = Flow[BufferedImage].map{ bi =>
+    val content = tesseract.doOCR(bi)
+    println("OCR Content:")
+    println(s"$content")
+    content
+  }
 
-  def imageSink(path:String, format:String = "png") = Sink.foreachParallel[BufferedImage](4)(bi => {
-    ImageIO.write(bi, format, new File(path))
+  private def imageSink(path:String, format:String = "png") = Sink.foreachAsync[BufferedImage](4)(bi => {
+    Future( ImageIO.write(bi, format, new File(path)) )
   })
 
-  val imageEnhance = bufferedImageToMat.via(enhanceMat).via(matToBufferedImage)
+  private val imageEnhance = bufferedImageToMat.via(enhanceMat).via(matToBufferedImage)
 
-  val imagePreProcessFlow =
+  private val imagePreProcessFlow =
     imageToBinaryImage.alsoTo(imageSink("binary.png"))
     .via(imageEnhance).alsoTo(imageSink("enhanced.png"))
     .via(imageDeSkew()).alsoTo(imageSink("deskew.png"))
 
-  val ocrFlow = imageOcr.via(spellCheck).via(extractPersons).via(extractDates)
+  val ocrFlow = imageOcr //.via(spellCheck).via(extractPersons).via(extractDates)
 
-  val staticResources =
-    get {
-      (pathEndOrSingleSlash & redirectToTrailingSlashIfMissing(StatusCodes.TemporaryRedirect)) {
-        getFromResource("public/index.html")
-      } ~ {
-        getFromResourceDirectory("public")
-      }
-    }
+  def main(args: Array[String]): Unit = {
+    Source.single(new File(s"${sys.props("user.dir")}/data/input"))
+      .mapConcat(_.listFiles().toList)
+      .mapConcat(_.listFiles().toList)
+      .alsoTo(Sink.foreach(file => println(s"Processing image:${file.getAbsolutePath}")))
+      .map(ImageIO.read)
+      .via(imagePreProcessFlow)
+      .via(ocrFlow)
+      .runWith(Sink.ignore)
+  }
+  import scala.concurrent.duration._
+  system.scheduler.scheduleOnce(30.seconds) {
+    system.terminate().foreach(_ => println("Exiting..."))
+  }
 
-  val route = path("image" / "ocr") {
-    post {
-      fileUpload("fileUpload") {
-        case (_, fileStream) =>
-          val inputStream = fileStream.runWith(StreamConverters.asInputStream())
-          val image = ImageIO.read(inputStream)
-          val ocr = Source.single(image).via(imagePreProcessFlow).via(ocrFlow)
-
-          complete(ocr)
-      }
-    }
-  } ~ staticResources
-
-  Http().bindAndHandle(route, "localhost", 8080)
 }
 
 case class OcrSuggestions(ocr:String, suggestions: Set[Map[String, List[String]]])
@@ -157,8 +149,12 @@ case class OcrSuggestionsPersons(ocr:String, suggestions: Set[Map[String, List[S
 case class OcrSuggestionsPersonsDates(ocr:String, suggestions: Set[Map[String, List[String]]], persons: List[String], dates: List[(List[String], String)])
 
 trait OCR {
-  lazy val tesseract: Tesseract = new Tesseract
-  tesseract.setDatapath("/usr/local/Cellar/tesseract/4.1.1/share/tessdata/")
+  lazy val tesseract: Tesseract = {
+    val instance = new Tesseract
+    instance.setDatapath("/usr/share/tesseract-ocr/4.00/tessdata/")
+    instance.setTessVariable("user_defined_dpi", "300")
+    instance
+  }
 }
 
 trait Spell {
